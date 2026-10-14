@@ -1,0 +1,9 @@
+# Only needed for CodeBERT fine-tuning / inference and dataset generation.
+-r requirements.txt
+torch>=2.2
+transformers>=4.40
+datasets>=2.19
+anthropic>=0.30
+openai>=1.30
+pytest>=8.0
+httpx>=0.27
