@@ -75,3 +75,47 @@ def test_unparseable_code_still_returns_a_report(client):
 
 def test_metrics_endpoint_empty_without_training(client):
     assert client.get("/api/v1/metrics").json()["xgboost"] is None
+
+
+def test_health_includes_parser_diagnostics(client):
+    j = client.get("/api/v1/health").json()
+    assert "parsers" in j
+    for lang in ("python", "java", "c", "cpp", "javascript"):
+        assert lang in j["parsers"]
+        assert "available" in j["parsers"][lang]
+        assert "module" in j["parsers"][lang]
+
+
+def test_orphaned_jobs_recovered_on_startup(tmp_path):
+    from app.db import Analysis, init_db, session
+    from app.main import create_app
+    from fastapi.testclient import TestClient
+
+    db_path = tmp_path / "test_orphan.db"
+    db_url = f"sqlite:///{db_path}"
+    init_db(db_url)
+
+    with session() as s:
+        s.add(Analysis(id="job_running", mode="single", status="running", n_files=1))
+        s.add(Analysis(id="job_queued", mode="single", status="queued", n_files=1))
+        s.add(Analysis(id="job_done", mode="single", status="done", n_files=1, result={"ok": True}))
+        s.add(Analysis(id="job_failed", mode="single", status="failed", error="Prior failure"))
+        s.commit()
+
+    with TestClient(create_app(db_url)) as new_client:
+        r_run = new_client.get("/api/v1/jobs/job_running").json()
+        assert r_run["status"] == "failed"
+        assert "restarted" in r_run["error"].lower()
+
+        r_que = new_client.get("/api/v1/jobs/job_queued").json()
+        assert r_que["status"] == "failed"
+        assert "restarted" in r_que["error"].lower()
+
+        r_done = new_client.get("/api/v1/jobs/job_done").json()
+        assert r_done["status"] == "done"
+        assert r_done["result"] == {"ok": True}
+
+        r_fail = new_client.get("/api/v1/jobs/job_failed").json()
+        assert r_fail["status"] == "failed"
+        assert r_fail["error"] == "Prior failure"
+

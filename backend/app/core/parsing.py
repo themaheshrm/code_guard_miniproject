@@ -207,6 +207,7 @@ _TS_MODULES = {
     "cpp": "tree_sitter_cpp", "javascript": "tree_sitter_javascript",
 }
 _TS_CACHE: dict[str, object] = {}
+_TS_ERRORS: dict[str, str] = {}
 
 
 def _ts_parser(lang: str):
@@ -216,9 +217,24 @@ def _ts_parser(lang: str):
 
             mod = importlib.import_module(_TS_MODULES[lang])
             _TS_CACHE[lang] = Parser(Language(mod.language()))
-        except Exception:  # pragma: no cover - missing optional grammar
+        except Exception as e:  # pragma: no cover - missing optional grammar
             _TS_CACHE[lang] = None
+            _TS_ERRORS[lang] = f"{type(e).__name__}: {e}"
     return _TS_CACHE[lang]
+
+
+def get_parser_diagnostics() -> dict[str, dict]:
+    """Return availability and diagnostic info for all supported AST parser grammars."""
+    diagnostics = {}
+    for lang, mod_name in _TS_MODULES.items():
+        parser = _ts_parser(lang)
+        diagnostics[lang] = {
+            "module": mod_name,
+            "available": parser is not None,
+            "error": _TS_ERRORS.get(lang),
+        }
+    return diagnostics
+
 
 
 def _ts_name(n) -> str:

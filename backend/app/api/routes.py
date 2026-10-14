@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..core.parsing import get_parser_diagnostics
 from ..db import Analysis, Submission, get_session
 from ..schemas import AnalyzeRequest, FileIn, JobOut, Options
 
@@ -32,7 +33,12 @@ def _validate(req: AnalyzeRequest, request: Request) -> None:
 
 @router.get("/health")
 def health(request: Request):
-    return {"status": "ok", "models": request.app.state.engine.ai.status()}
+    return {
+        "status": "ok",
+        "models": request.app.state.engine.ai.status(),
+        "parsers": get_parser_diagnostics(),
+    }
+
 
 
 @router.post("/analyze")
