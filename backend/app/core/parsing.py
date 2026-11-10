@@ -258,7 +258,7 @@ def _ts_node(n, depth: int) -> Node:
     kids: list[Node] = []
     if depth < _MAX_DEPTH:
         for c in n.children:
-            if c.is_named or (c.type not in _PUNCT and not (c.type[0].isalnum() or c.type[0] == "_")):
+            if c.is_named or (c.type not in _PUNCT and bool(c.type) and not (c.type[0].isalnum() or c.type[0] == "_")):
                 kids.append(_ts_node(c, depth + 1))
     name = _ts_name(n) if n.type in FUNC_TYPES or n.type.endswith("_declaration") or n.type.endswith("_definition") else ""
     return _finish(Node(n.type, n.start_point[0] + 1, n.end_point[0] + 1, kids, name))

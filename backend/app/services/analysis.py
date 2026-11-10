@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -13,6 +14,8 @@ from ..detectors.ai_detector import AIDetector
 from ..detectors.plagiarism import Fingerprint, PlagiarismConfig, build_fingerprint, clusters, compare, compare_batch
 from ..detectors.vulnerability import VulnModel, analyze_vulnerabilities
 from ..schemas import AnalyzeRequest
+
+logger = logging.getLogger("codeguard.analysis")
 
 
 @dataclass
@@ -103,8 +106,14 @@ def run_analysis(engine: Engine, req: AnalyzeRequest, analysis_id: str | None = 
     }
     if opts.persist and analysis_id:
         with session() as db:
-            for x, fp in zip(files, fps):
-                db.add(Submission(analysis_id=analysis_id, name=x["in"].name, language=x["language"], sha256=fp.sha256,
-                                  code=x["in"].code, fingerprint=fp.to_dict()))
-            db.commit()
+            a = db.get(Analysis, analysis_id)
+            if a is not None:  # Ensure analysis has not been concurrently deleted
+                for x, fp in zip(files, fps):
+                    db.add(Submission(analysis_id=analysis_id, name=x["in"].name, language=x["language"], sha256=fp.sha256,
+                                      code=x["in"].code, fingerprint=fp.to_dict()))
+                try:
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.warning("Could not persist submissions for analysis %s: %s", analysis_id, e)
     return report

@@ -76,8 +76,9 @@ class CodeBERTDetector:
         size, stride = 510, 256
         windows = [ids[i:i + size] for i in range(0, max(1, len(ids) - size + stride), stride)] or [ids]
         probs = []
+        dev = next(self._model.parameters()).device if self._model else "cpu"
         for w in windows[:12]:
-            inp = torch.tensor([[self._tok.cls_token_id] + w + [self._tok.sep_token_id]])
+            inp = torch.tensor([[self._tok.cls_token_id] + w + [self._tok.sep_token_id]], device=dev)
             with torch.no_grad():
                 probs.append(float(torch.softmax(self._model(input_ids=inp).logits, -1)[0, 1]))
         return float(np.mean(probs))

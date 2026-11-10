@@ -130,8 +130,8 @@ def _ast_match(a: Fingerprint, b: Fingerprint) -> tuple[int, list[dict]]:
     for s, e, size, h in items:
         if remaining.get(h, 0) <= 0:
             continue
-        if any(cs <= s and e <= ce and (e - s) < (ce - cs) + 1 and (cs, ce) != (s, e) for cs, ce in covered_spans):
-            continue  # nested inside an already matched larger subtree
+        if any(cs <= s and e <= ce for cs, ce in covered_spans):
+            continue  # nested inside or redundant with an already matched larger subtree
         remaining[h] -= 1
         bs, be, _ = b_ranges[h].pop(0)
         covered_nodes += size

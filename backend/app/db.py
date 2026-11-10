@@ -54,7 +54,9 @@ _Session: sessionmaker | None = None
 def init_db(url: str | None = None) -> None:
     global _engine, _Session
     url = url or get_settings().database_url
-    kwargs = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
+    kwargs = {}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
     if url.startswith("sqlite:///") and ":memory:" not in url:
         from pathlib import Path
         Path(url.replace("sqlite:///", "", 1)).parent.mkdir(parents=True, exist_ok=True)
@@ -66,8 +68,11 @@ def init_db(url: str | None = None) -> None:
         from sqlalchemy import event
 
         @event.listens_for(_engine, "connect")
-        def _fk(dbapi_conn, _):  # enforce ON DELETE CASCADE
+        def _on_sqlite_connect(dbapi_conn, _):
             dbapi_conn.execute("PRAGMA foreign_keys=ON")
+            dbapi_conn.execute("PRAGMA busy_timeout=30000")
+            if not url.endswith(":memory:"):
+                dbapi_conn.execute("PRAGMA journal_mode=WAL")
     Base.metadata.create_all(_engine)
     _Session = sessionmaker(_engine, expire_on_commit=False)
 

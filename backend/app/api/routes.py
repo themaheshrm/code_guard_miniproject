@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..core.parsing import get_parser_diagnostics
-from ..db import Analysis, Submission, get_session
+from ..db import Analysis, Submission, get_session, session
 from ..schemas import AnalyzeRequest, FileIn, JobOut, Options
 
 router = APIRouter(prefix="/api/v1")
@@ -48,14 +48,13 @@ def analyze_sync(req: AnalyzeRequest, request: Request):
     q = request.app.state.jobs
     aid = q.create(req)
     q.run_sync(aid, req)
-    with_session = next(get_session())
-    try:
-        a = with_session.get(Analysis, aid)
+    with session() as db_session:
+        a = db_session.get(Analysis, aid)
+        if not a:
+            raise HTTPException(404, "Analysis not found")
         if a.status == "failed":
             raise HTTPException(500, a.error)
         return _out(a)
-    finally:
-        with_session.close()
 
 
 @router.post("/jobs", status_code=202)
@@ -79,6 +78,7 @@ async def create_job_upload(
     except Exception as e:
         raise HTTPException(422, f"Invalid options JSON: {e}")
     items: list[FileIn] = []
+    seen_names: dict[str, int] = {}
     for up in files:
         raw = await up.read()
         try:
@@ -87,7 +87,15 @@ async def create_job_upload(
             text = raw.decode("latin-1")
         if not text.strip():
             continue
-        items.append(FileIn(name=Path(up.filename or "upload").name, code=text))
+        base_name = Path(up.filename or "upload").name
+        if base_name in seen_names:
+            seen_names[base_name] += 1
+            p = Path(base_name)
+            final_name = f"{p.stem}_{seen_names[base_name]}{p.suffix}"
+        else:
+            seen_names[base_name] = 0
+            final_name = base_name
+        items.append(FileIn(name=final_name, code=text))
     if not items:
         raise HTTPException(422, "No non-empty files uploaded.")
     req = AnalyzeRequest(files=items, options=opts)

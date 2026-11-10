@@ -48,7 +48,7 @@ class JobQueue:
     def run_sync(self, analysis_id: str, req: AnalyzeRequest) -> None:
         self._run(analysis_id, req)
 
-    def shutdown(self, wait: bool = False, cancel_futures: bool = True) -> None:
+    def shutdown(self, wait: bool = True, cancel_futures: bool = True) -> None:
         self.pool.shutdown(wait=wait, cancel_futures=cancel_futures)
 
     def _run(self, analysis_id: str, req: AnalyzeRequest) -> None:
@@ -62,11 +62,14 @@ class JobQueue:
 
     @staticmethod
     def _set(analysis_id: str, **fields) -> None:
-        with session() as db:
-            a = db.get(Analysis, analysis_id)
-            if a is None:  # deleted while running
-                return
-            for k, v in fields.items():
-                setattr(a, k, v)
-            db.commit()
+        try:
+            with session() as db:
+                a = db.get(Analysis, analysis_id)
+                if a is None:  # deleted while running
+                    return
+                for k, v in fields.items():
+                    setattr(a, k, v)
+                db.commit()
+        except Exception as e:
+            logger.error("Failed to update status for analysis %s: %s", analysis_id, e)
 

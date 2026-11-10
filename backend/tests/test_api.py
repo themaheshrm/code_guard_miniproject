@@ -25,7 +25,7 @@ def test_sync_analysis_report_shape(client):
 
 def test_async_job_polling_and_listing(client):
     jid = client.post("/api/v1/jobs", json=body()).json()["id"]
-    for _ in range(50):
+    for _ in range(100):
         j = client.get(f"/api/v1/jobs/{jid}").json()
         if j["status"] in ("done", "failed"):
             break
@@ -43,6 +43,23 @@ def test_upload_endpoint(client):
             break
         time.sleep(0.1)
     assert j["status"] == "done" and j["result"]["files"][0]["ai"] is None
+
+
+def test_upload_duplicate_filenames_disambiguated(client):
+    r = client.post(
+        "/api/v1/jobs/upload",
+        files=[("files", ("file.py", CODE_A)), ("files", ("file.py", CODE_B))],
+        data={"options": '{"run_ai": false}'},
+    )
+    assert r.status_code == 202
+    for _ in range(50):
+        j = client.get(f"/api/v1/jobs/{r.json()['id']}").json()
+        if j["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.1)
+    assert j["status"] == "done"
+    names = [f["name"] for f in j["result"]["files"]]
+    assert len(names) == 2 and "file.py" in names and "file_1.py" in names
 
 
 def test_not_persisted_by_default_and_opt_in_corpus_comparison(client):

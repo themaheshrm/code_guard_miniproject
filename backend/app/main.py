@@ -38,7 +38,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
         app.state.engine = build_engine(settings)
         app.state.jobs = JobQueue(app.state.engine, settings.job_workers)
         yield
-        app.state.jobs.shutdown(wait=False, cancel_futures=True)
+        app.state.jobs.shutdown(wait=True, cancel_futures=True)
         JobQueue.recover_orphaned_jobs("Server shut down before job could finish.")
 
     app = FastAPI(title="CodeGuard", version="1.0.0", description="AI-assisted code integrity analyzer", lifespan=lifespan)
