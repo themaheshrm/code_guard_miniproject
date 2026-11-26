@@ -52,7 +52,8 @@ def pick_threshold(y: np.ndarray, p: np.ndarray, max_fpr: float = 0.05) -> float
     if len(set(y.tolist())) < 2:
         return 0.5
     best, best_key = 0.5, (-1.0, -1.0)
-    for t in np.unique(np.round(p, 4)):
+    # floor (not round): a candidate taken from a score must never exceed that score, or p >= t silently fails
+    for t in np.unique(np.floor(np.asarray(p, dtype=float) * 1e4) / 1e4):
         pred = p >= t
         neg = (y == 0).sum()
         fpr = ((pred) & (y == 0)).sum() / neg if neg else 0.0

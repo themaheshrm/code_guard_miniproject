@@ -45,8 +45,28 @@ def test_xgboost_training_and_inference_roundtrip(pair_rows, tmp_path):
 
 
 def test_detector_reports_unavailable_without_models(tmp_path):
-    r = AIDetector(tmp_path, 0.4, 0.6).predict("x = 1\n" * 10, "python")
+    r = AIDetector(tmp_path, 0.4, 0.6, enable_heuristic=False).predict("x = 1\n" * 10, "python")
     assert r["status"] == "model_unavailable" and r["probability"] is None
+
+
+def test_heuristic_engine_separates_styles_and_explains(tmp_path):
+    from tests.conftest import synthetic_pair
+
+    det = AIDetector(tmp_path, 0.4, 0.6, enable_codebert=False)
+    h, a = synthetic_pair(7)
+    ph, pa = det.predict(h * 3, "python"), det.predict(a, "python")
+    assert ph["engine"] == pa["engine"] == "heuristic"
+    assert pa["label"] == "ai" and ph["label"] == "human" and pa["probability"] > ph["probability"] + 0.4
+    assert pa["top_features"] and all("label" in x and "contribution" in x for x in pa["top_features"])
+
+
+def test_heuristic_handles_every_language(tmp_path):
+    det = AIDetector(tmp_path, 0.4, 0.6, enable_codebert=False)
+    samples = {"java": "class A { int f(int x){ return x*2; } }", "c": "int main(){int a=1;return a;}",
+               "cpp": "#include <iostream>\nint main(){std::cout<<1;}", "javascript": "function f(a){return a+1}\nconsole.log(f(2))"}
+    for lang, code in samples.items():
+        r = det.predict(code, lang)
+        assert r["status"] == "ok" and 0 <= r["probability"] <= 1 and r["confidence"] == "low", lang
 
 
 def test_dataset_merge_keeps_only_matched_valid_problems(tmp_path):
@@ -68,3 +88,11 @@ def test_dataset_merge_keeps_only_matched_valid_problems(tmp_path):
 def test_extract_code_prefers_largest_fenced_block():
     assert extract_code("text\n```python\nx=1\n```\nmore\n```python\ny = 2\nz = 3\n```") == "y = 2\nz = 3"
     assert extract_code("print(1)") == "print(1)"
+
+
+def test_threshold_never_rounds_above_the_scores_it_came_from():
+    # regression: rounding 0.91609 up to 0.9161 made every positive fall below the chosen threshold
+    y = np.array([0] * 6 + [1] * 6)
+    p = np.array([0.08374] * 6 + [0.91609] * 6)
+    thr = pick_threshold(y, p, 0.05)
+    assert report(y, p, thr)["recall"] == 1.0 and report(y, p, thr)["false_positive_rate"] == 0.0

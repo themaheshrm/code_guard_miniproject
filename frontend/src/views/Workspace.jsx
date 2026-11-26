@@ -1,207 +1,270 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
-import { BarChart, Bar, XAxis, YAxis, Tooltip, Cell, ResponsiveContainer } from "recharts";
+import { Bot, Copy, Download, ExternalLink, FilePlus2, FileUp, FlaskConical, FolderUp, Pencil, Play, ShieldAlert, UploadCloud, X } from "lucide-react";
+import "../monaco.js";
 import { api } from "../api.js";
-import { EXAMPLE, langOf, pairsFor, pct } from "../lib.js";
-import { Heatmap, Meter } from "../components.jsx";
+import { ACCEPT, EXAMPLES, LANG_LABEL, MONACO_LANG, download, isSupported, langOf, pairsFor, pct, uniqueName } from "../lib.js";
+import { Badge, Button, Empty, ErrorBox, Modal, cx, useToast } from "../ui.jsx";
+import { FileReport, FilesTable } from "./Report.jsx";
 
-const OPT_LABELS = [["run_ai", "AI-code detection"], ["run_plagiarism", "Plagiarism"], ["run_vulnerability", "Vulnerabilities"],
-  ["compare_corpus", "Compare with saved corpus"], ["persist", "Save submissions to corpus"]];
+const Compare = lazy(() => import("./Compare.jsx"));
 
-export default function Workspace({ ws, setWs }) {
-  const { files, active, options, job, ranCode } = ws;
-  const file = files[active] || files[0];
+const OPTIONS = [
+  ["run_ai", "AI-code detection", Bot], ["run_plagiarism", "Plagiarism", Copy], ["run_vulnerability", "Vulnerabilities", ShieldAlert],
+  ["compare_corpus", "Compare with saved corpus"], ["persist", "Save to corpus"],
+];
+const LAYERS = [["ai", "AI blocks"], ["sim", "Similarity"], ["vuln", "Security"]];
+const MAX_BYTES = 500_000, MAX_FILES = 100;
+
+export default function Workspace({ ws, setWs, job, setJob, theme, go, health }) {
+  const toast = useToast();
+  const { files, active, options, title } = ws;
+  const file = files[Math.min(active, files.length - 1)] || files[0];
   const [layers, setLayers] = useState({ ai: true, sim: true, vuln: true });
   const [selPair, setSelPair] = useState(null);
-  const [dragging, setDragging] = useState(false);
-  const edRef = useRef(null), monRef = useRef(null);
+  const [dragging, setDragging] = useState(0);
+  const [renaming, setRenaming] = useState(null);
+  const [comparing, setComparing] = useState(null);
+  const [tab, setTab] = useState("overview");
+  const edRef = useRef(null), monRef = useRef(null), runRef = useRef(null);
   const [ready, setReady] = useState(false);
   const rep = job.report;
-  const stale = !!rep && ranCode[file.name] !== undefined && ranCode[file.name] !== file.code;
+  const ranCode = job.ranCode || {};
   const fileRep = rep?.files.find((f) => f.name === file.name);
+  const stale = !!fileRep && ranCode[file.name] !== undefined && ranCode[file.name] !== file.code;
+  const busy = job.status === "queued" || job.status === "running";
+  const nonEmpty = files.filter((f) => f.code.trim()).length;
+
   const patch = (p) => setWs((s) => ({ ...s, ...p }));
   const setFile = (i, p) => setWs((s) => ({ ...s, files: s.files.map((f, k) => (k === i ? { ...f, ...p } : f)) }));
+  const selectByName = (name) => { const i = files.findIndex((f) => f.name === name); if (i >= 0) patch({ active: i }); };
 
+  // ----------------------------------------------------------------- editor decorations
   useEffect(() => {
     const ed = edRef.current, monaco = monRef.current;
-    if (!ready || !ed || !monaco || !rep || stale || !fileRep) return;
-    const mk = (s, e, cls, msg) => ({ range: new monaco.Range(s, 1, e, 1), options: { isWholeLine: true, linesDecorationsClassName: cls, className: `${cls}-bg`, hoverMessage: { value: msg } } });
+    if (!ready || !ed || !monaco || !fileRep || stale) return;
+    const max = ed.getModel()?.getLineCount() || 1;
+    const mk = (s, e, cls, msg) => ({ range: new monaco.Range(Math.min(s, max), 1, Math.min(e, max), 1),
+      options: { isWholeLine: true, linesDecorationsClassName: cls, className: `${cls}-bg`, hoverMessage: { value: msg },
+        overviewRuler: { color: cls === "cg-bar-ai" ? "#9887ef" : cls === "cg-bar-sim" ? "#d28e05" : "#eb6263", position: 4 } } });
     const d = [];
-    if (layers.ai && fileRep.ai?.blocks) for (const b of fileRep.ai.blocks) if (b.contribution > 0.02) d.push(mk(b.start, b.end, "cg-bar-ai", `**AI attribution** +${b.contribution.toFixed(2)} — ${b.name}`));
+    if (layers.ai && fileRep.ai?.blocks) for (const b of fileRep.ai.blocks) if (b.contribution > 0.02) d.push(mk(b.start, b.end, "cg-bar-ai", `**AI attribution** +${b.contribution.toFixed(2)} — \`${b.name}\``));
     if (layers.sim) for (const p of pairsFor(rep, file.name, selPair)) {
       const other = p.a === file.name ? p.b : p.a;
-      for (const [s, e] of p.a === file.name ? p.lines_a : p.lines_b) d.push(mk(s, e, "cg-bar-sim", `**Similar to** ${other} (${pct(p.score)})`));
+      for (const [s, e] of p.a === file.name ? p.lines_a : p.lines_b) d.push(mk(s, e, "cg-bar-sim", `**Similar to** \`${other}\` (${pct(p.score)})`));
     }
-    if (layers.vuln && fileRep.vulnerability) for (const x of fileRep.vulnerability.findings) d.push(mk(x.line, x.line, "cg-bar-vuln", `**${x.cwe}** ${x.message}`));
+    if (layers.vuln && fileRep.vulnerability) for (const x of fileRep.vulnerability.findings) d.push(mk(x.line, x.line, "cg-bar-vuln", `**${x.severity.toUpperCase()} · ${x.cwe}** ${x.message}${x.fix ? `\n\nFix: ${x.fix}` : ""}`));
     const coll = ed.createDecorationsCollection(d);
     return () => coll.clear();
   }, [rep, file.name, layers, selPair, ready, stale, fileRep]);
 
-  const reveal = (line) => edRef.current?.revealLineInCenter(line);
-  const addFile = (name, code = "") => setWs((s) => ({ ...s, files: [...s.files, { name, code }], active: s.files.length }));
+  const reveal = useCallback((line, end = line) => {
+    const ed = edRef.current;
+    if (!ed) return;
+    ed.revealLinesInCenter(line, end);
+    ed.setSelection({ startLineNumber: line, startColumn: 1, endLineNumber: end, endColumn: 1 });
+    ed.focus();
+  }, []);
+
+  // ----------------------------------------------------------------- files
+  const addFile = () => setWs((s) => {
+    const taken = new Set(s.files.map((f) => f.name));
+    return { ...s, files: [...s.files, { name: uniqueName(`submission_${s.files.length + 1}.py`, taken), code: "" }], active: s.files.length };
+  });
   const removeFile = (i) => setWs((s) => {
     const f = s.files.filter((_, k) => k !== i);
-    return { ...s, files: f.length ? f : [{ name: "submission_1.py", code: "" }], active: Math.max(0, Math.min(s.active, f.length - 1)) };
+    return { ...s, files: f.length ? f : [{ name: "submission_1.py", code: "" }], active: Math.max(0, Math.min(s.active >= i ? s.active - 1 : s.active, f.length - 1)) };
   });
-  const rename = (i) => { const n = prompt("File name (the extension sets the language)", files[i].name); if (n?.trim()) setFile(i, { name: n.trim() }); };
 
   async function readFiles(list) {
-    const items = await Promise.all([...list].map((f) => f.text().then((code) => ({ name: f.name, code }))));
+    const picked = [...list];
+    const skipped = [];
+    const items = [];
+    for (const f of picked) {
+      if (!isSupported(f.name)) { skipped.push(`${f.name} (unsupported type)`); continue; }
+      if (f.size > MAX_BYTES) { skipped.push(`${f.name} (over 500 KB)`); continue; }
+      const code = await f.text();
+      if (code.includes("\u0000")) { skipped.push(`${f.name} (binary)`); continue; }
+      if (code.trim()) items.push({ name: f.name, code: code.replace(/\r\n/g, "\n") });
+    }
+    if (skipped.length) toast.info(`Skipped ${skipped.length} file(s): ${skipped.slice(0, 3).join(", ")}${skipped.length > 3 ? "…" : ""}`);
+    if (!items.length) return;
     setWs((s) => {
       const keep = s.files.filter((f) => f.code.trim());
-      const names = new Set(keep.map((f) => f.name));
-      const all = [...keep, ...items.filter((f) => f.code.trim() && !names.has(f.name))];
-      return { ...s, files: all.length ? all : s.files, active: all.length > keep.length ? keep.length : 0 };
+      const taken = new Set(keep.map((f) => f.name));
+      const added = items.slice(0, Math.max(0, MAX_FILES - keep.length)).map((f) => { const name = uniqueName(f.name, taken); taken.add(name); return { ...f, name }; });
+      if (added.length < items.length) toast.info(`Only ${MAX_FILES} files can be analyzed at once.`);
+      return { ...s, files: [...keep, ...added], active: keep.length };
     });
+    toast.success(`Added ${items.length} file${items.length > 1 ? "s" : ""}.`);
   }
 
+  const loadExample = (ex) => {
+    setWs((s) => ({ ...s, files: ex.files.map((f) => ({ ...f })), active: 0, title: ex.title }));
+    setJob({ status: "idle", report: null, error: null, ranCode: {} });
+    setSelPair(null);
+  };
+
+  // ----------------------------------------------------------------- run
   async function run() {
-    const payload = files.filter((f) => f.code.trim()).map((f) => ({ name: f.name, code: f.code, language: langOf(f.name) }));
-    patch({ job: { status: "queued", report: null, error: null } });
+    const payload = files.filter((f) => f.code.trim()).map((f) => ({ name: f.name, code: f.code, language: isSupported(f.name) ? langOf(f.name) : undefined }));
+    if (!payload.length || busy) return;
+    if (!options.run_ai && !options.run_plagiarism && !options.run_vulnerability) { toast.error("Enable at least one analysis."); return; }
+    setJob({ status: "queued", report: job.report, error: null, ranCode: job.ranCode || {} });
     setSelPair(null);
     try {
-      const done = await api.run(payload, options, (status) => setWs((s) => ({ ...s, job: { ...s.job, status } })));
-      patch({ job: { status: "done", report: done.result, error: null, id: done.id }, ranCode: Object.fromEntries(payload.map((f) => [f.name, f.code])) });
+      const done = await api.run(payload, options, title, (status) => setJob((j) => ({ ...j, status })));
+      setJob({ status: "done", report: done.result, error: null, id: done.id, ranCode: Object.fromEntries(payload.map((f) => [f.name, f.code])) });
+      const s = done.result.summary;
+      toast.success(`Analyzed ${s.n_files} file${s.n_files > 1 ? "s" : ""} in ${Math.round(done.result.duration_ms)} ms.`);
     } catch (e) {
-      patch({ job: { status: "failed", report: null, error: e.message } });
+      setJob((j) => ({ ...j, status: "failed", error: e.message }));
+      toast.error(e.message);
     }
   }
-  const busy = job.status === "queued" || job.status === "running";
-  const nonEmpty = files.filter((f) => f.code.trim()).length;
+  runRef.current = run;
+  useEffect(() => {
+    const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runRef.current(); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const codeOf = (name) => (ranCode[name] ?? files.find((f) => f.name === name)?.code ?? "");
+  const lang = langOf(file.name);
 
   return (
     <div className="ws">
-      <section className="pane" aria-label="Code editor"
-        onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
-        onDrop={(e) => { e.preventDefault(); setDragging(false); readFiles(e.dataTransfer.files); }}>
-        <div className="bar">
-          <div className="tabs" role="tablist">
-            {files.map((f, i) => (
-              <button key={i} role="tab" aria-selected={i === active} className="tab" onClick={() => patch({ active: i })} onDoubleClick={() => rename(i)} title="Double-click to rename">
-                {f.name}
-                {files.length > 1 && <span className="x" role="button" aria-label={`Remove ${f.name}`} onClick={(e) => { e.stopPropagation(); removeFile(i); }}>×</span>}
-              </button>
-            ))}
+      <section className="pane ed-pane" aria-label="Code editor"
+        onDragEnter={(e) => { e.preventDefault(); setDragging((d) => d + 1); }} onDragOver={(e) => e.preventDefault()}
+        onDragLeave={() => setDragging((d) => Math.max(0, d - 1))}
+        onDrop={(e) => { e.preventDefault(); setDragging(0); readFiles(e.dataTransfer.files); }}>
+        <div className="ed-top">
+          <input className="title-in" value={title || ""} maxLength={200} placeholder="Untitled analysis (e.g. CS101 · Lab 3)" aria-label="Analysis title"
+            onChange={(e) => patch({ title: e.target.value })} />
+          <div className="ed-tools">
+            <Button size="sm" icon={FilePlus2} onClick={addFile} title="New empty file">New</Button>
+            <label className="btn ghost sm" title="Upload source files"><FileUp size={14} aria-hidden /><span>Upload</span>
+              <input type="file" multiple hidden accept={ACCEPT} onChange={(e) => { readFiles(e.target.files); e.target.value = ""; }} /></label>
+            <label className="btn ghost sm" title="Upload every supported file in a folder"><FolderUp size={14} aria-hidden /><span>Folder</span>
+              <input type="file" multiple hidden webkitdirectory="" directory="" onChange={(e) => { readFiles(e.target.files); e.target.value = ""; }} /></label>
           </div>
-          <button className="btn" onClick={() => addFile(`submission_${files.length + 1}.py`)}>Add file</button>
-          <label className="btn">Upload<input type="file" multiple hidden accept=".py,.java,.c,.h,.cpp,.cc,.hpp,.js,.mjs,.jsx" onChange={(e) => { readFiles(e.target.files); e.target.value = ""; }} /></label>
+        </div>
+        <div className="ftabs" role="tablist" aria-label="Files">
+          {files.map((f, i) => {
+            const r = rep?.files.find((x) => x.name === f.name);
+            return (
+              <div key={f.name + i} role="tab" aria-selected={i === active} tabIndex={0} className={cx("ftab", i === active && "on")}
+                onClick={() => patch({ active: i })} onKeyDown={(e) => e.key === "Enter" && patch({ active: i })} onDoubleClick={() => setRenaming({ i, name: f.name })} title="Double-click to rename">
+                {r && <span className={`lv lv-${r.verdict.level}`} aria-label={r.verdict.level} />}
+                <span className="mono">{f.name}</span>
+                <button className="x" aria-label={`Remove ${f.name}`} onClick={(e) => { e.stopPropagation(); removeFile(i); }}><X size={12} /></button>
+              </div>
+            );
+          })}
         </div>
         <div className="editor">
-          {dragging && <div className="drop">Drop files to add them</div>}
-          <Editor height="100%" path={file.name} language={langOf(file.name)} value={file.code} theme="vs"
+          {dragging > 0 && <div className="drop"><UploadCloud size={36} aria-hidden /><b>Drop source files</b><span>.py .java .c .cpp .js</span></div>}
+          <Editor height="100%" path={file.name} language={MONACO_LANG[lang]} value={file.code} theme={theme === "dark" ? "cg-dark" : "cg-light"}
             onChange={(v) => setFile(active, { code: v ?? "" })}
+            loading={<div className="page-loading"><span className="spin" /> Loading editor…</div>}
             onMount={(ed, monaco) => { edRef.current = ed; monRef.current = monaco; setReady(true); }}
-            options={{ minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true, glyphMargin: false, folding: false, lineDecorationsWidth: 10 }} />
+            options={{ minimap: { enabled: false }, fontSize: 13.5, lineHeight: 21, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 12 },
+              fontFamily: "'JetBrains Mono', ui-monospace, Consolas, monospace", fontLigatures: true, smoothScrolling: true,
+              cursorSmoothCaretAnimation: "on", lineDecorationsWidth: 10, renderLineHighlight: "line", tabSize: 4 }} />
+          {!file.code && <div className="ed-hint"><p>Paste code here, drop files anywhere on this panel, or</p>
+            <div className="row-wrap">{EXAMPLES.map((ex) => <Button key={ex.id} size="sm" icon={FlaskConical} onClick={() => loadExample(ex)}>{ex.title}</Button>)}</div></div>}
+        </div>
+        <div className="ed-status">
+          <Badge tone="neutral" icon={false}>{LANG_LABEL[lang]}</Badge>
+          <span className="muted">{file.code ? file.code.split("\n").length : 0} lines · {(new Blob([file.code]).size / 1024).toFixed(1)} KB</span>
+          <button className="linkbtn" onClick={() => setRenaming({ i: active, name: file.name })}><Pencil size={12} aria-hidden /> Rename</button>
+          {stale && <Badge tone="warn">edited since analysis</Badge>}
         </div>
         <div className="opts">
-          {OPT_LABELS.map(([k, l]) => (
-            <label key={k}><input type="checkbox" checked={!!options[k]} onChange={(e) => patch({ options: { ...options, [k]: e.target.checked } })} />{l}</label>
-          ))}
-          <span style={{ marginLeft: "auto" }}>
-            <button className="btn primary" disabled={busy || !nonEmpty} onClick={run}>{busy ? "Analyzing…" : `Analyze ${nonEmpty > 1 ? `${nonEmpty} files` : "code"}`}</button>
-          </span>
+          <div className="toggles">
+            {OPTIONS.map(([k, l, Icon]) => (
+              <label key={k} className={cx("toggle", options[k] && "on")}>
+                <input type="checkbox" checked={!!options[k]} onChange={(e) => patch({ options: { ...options, [k]: e.target.checked } })} />
+                <span className="sw" aria-hidden />{Icon && <Icon size={13} aria-hidden />}{l}
+              </label>
+            ))}
+          </div>
+          <Button variant="primary" icon={Play} loading={busy} disabled={!nonEmpty || health === false} onClick={run} title="Ctrl + Enter">
+            {busy ? (job.status === "queued" ? "Queued…" : "Analyzing…") : `Analyze ${nonEmpty > 1 ? `${nonEmpty} files` : "code"}`}
+          </Button>
         </div>
       </section>
 
-      <section className="pane" aria-label="Results" aria-live="polite">
-        <div className="bar"><strong>Integrity report</strong></div>
-        <div className="body">
-          {job.error && <div className="err" role="alert"><b>Analysis failed.</b> {job.error}</div>}
-          {!rep && !busy && !job.error && (
-            <div className="empty">
-              <h2>Paste, upload or drop source code</h2>
-              <p>CodeGuard estimates whether code is AI-generated, how closely it matches other submissions (even after renaming and reordering), and which lines look insecure.</p>
-              <button className="btn" onClick={() => setWs((s) => ({ ...s, files: EXAMPLE, active: 0 }))}>Load three example submissions</button>
+      <section className="pane res-pane" aria-label="Results" aria-live="polite">
+        <div className="res-h">
+          <h2>Integrity report</h2>
+          {rep && <div className="row-wrap">
+            {job.id && <Button size="sm" icon={ExternalLink} onClick={() => go("report", job.id)}>Full report</Button>}
+            <Button size="sm" icon={Download} onClick={() => download(`codeguard-${(rep.title || "report").replace(/\W+/g, "_")}.json`, JSON.stringify(rep, null, 2))}>JSON</Button>
+          </div>}
+        </div>
+        <div className="res-b">
+          {busy && <div className="progress" role="status"><div className="progress-bar" /><span>{job.status === "queued" ? "Waiting for a worker…" : "Parsing, fingerprinting and scoring…"}</span></div>}
+          {job.error && <ErrorBox>{job.error}</ErrorBox>}
+          {health === false && !rep && <ErrorBox>The API is offline. Start the backend, then reload this page.</ErrorBox>}
+          {!rep && !busy && (
+            <div className="welcome">
+              <Empty icon={ShieldAlert} title="Analyze code for integrity risks">
+                CodeGuard estimates whether code is AI-generated, finds copying that survives renaming and reordering, and flags insecure lines with fixes.
+              </Empty>
+              <div className="examples">
+                {EXAMPLES.map((ex) => (
+                  <button key={ex.id} className="example" onClick={() => loadExample(ex)}>
+                    <FlaskConical size={18} aria-hidden /><b>{ex.title}</b><span>{ex.desc}</span><em>{ex.files.length} files</em>
+                  </button>
+                ))}
+              </div>
+              <p className="muted small center">Tip: press <kbd>Ctrl</kbd> + <kbd>Enter</kbd> to analyze.</p>
             </div>
           )}
-          {busy && <div className="empty">Analyzing ({job.status})…</div>}
-          {rep && fileRep && <Report rep={rep} f={fileRep} stale={stale} layers={layers} setLayers={setLayers} selPair={selPair} setSelPair={setSelPair} reveal={reveal} />}
-          {rep && !fileRep && <div className="warn">This tab was not part of the last analysis. Run it again to include {file.name}.</div>}
+          {rep && (
+            <>
+              {rep.files.length > 1 && <FilesTable rep={rep} selected={file.name} onSelect={selectByName} />}
+              {fileRep ? (
+                <>
+                  {stale && <div className="note warn">This file changed after the analysis. Editor highlights are hidden until you analyze again.</div>}
+                  <div className="layer-row">
+                    <span className="muted small">Editor highlights</span>
+                    <div className="chips">
+                      {LAYERS.map(([k, l]) => <button key={k} className={`chip lay-${k}`} aria-pressed={layers[k]} onClick={() => setLayers({ ...layers, [k]: !layers[k] })}><i />{l}</button>)}
+                    </div>
+                  </div>
+                  <FileReport rep={rep} f={fileRep} reveal={stale ? undefined : reveal} selPair={selPair} setSelPair={setSelPair} tab={tab} setTab={setTab}
+                    canCompare onCompare={setComparing} />
+                </>
+              ) : <div className="note info">“{file.name}” was not part of the last analysis. Analyze again to include it.</div>}
+            </>
+          )}
         </div>
       </section>
+
+      <RenameModal state={renaming} files={files} onClose={() => setRenaming(null)} onSave={(i, name) => { setFile(i, { name }); setRenaming(null); }} />
+      {comparing && <Suspense fallback={null}><Compare pair={comparing} codeOf={codeOf} theme={theme} onClose={() => setComparing(null)} /></Suspense>}
     </div>
   );
 }
 
-const LEGEND = { ai: "Violet bar: AI-attributed block", sim: "Amber bar: matches another file", vuln: "Red bar: risky line" };
-
-function Report({ rep, f, stale, layers, setLayers, selPair, setSelPair, reveal }) {
-  const ai = f.ai, v = f.vulnerability, plag = rep.plagiarism;
-  const names = plag?.names || [];
-  const myPairs = (plag?.pairs || []).filter((p) => p.a === f.name || p.b === f.name);
-  const feat = (ai?.top_features || []).map((x) => ({ ...x, name: x.feature, v: x.contribution }));
+function RenameModal({ state, files, onClose, onSave }) {
+  const [v, setV] = useState("");
+  useEffect(() => { if (state) setV(state.name); }, [state]);
+  if (!state) return null;
+  const clash = files.some((f, k) => k !== state.i && f.name === v.trim());
+  const bad = !v.trim() || /[\\/]/.test(v) || clash;
   return (
-    <>
-      {stale && <div className="warn">The code changed after this analysis. Highlights are hidden; run it again.</div>}
-      <div className={`verdict ${f.verdict.level}`}>
-        <h3>{{ clear: "No flags raised", attention: "One signal needs a look", review: "Several signals: review manually" }[f.verdict.level]}</h3>
-        {f.verdict.signals.map((s) => <p key={s.signal}>{s.flagged ? "⚑ " : "✓ "}{s.summary}</p>)}
-        <p>{f.verdict.disclaimer}</p>
-      </div>
-      {(f.warnings || []).map((w) => <div className="warn" key={w}>{w}</div>)}
-      {ai && (ai.status === "ok"
-        ? <Meter label="AI-generated" value={ai.probability} threshold={ai.threshold} color="var(--ai)" />
-        : <div className="warn"><b>AI detector not trained yet.</b> {ai.message}</div>)}
-      {f.max_similarity != null && <Meter label="Max similarity" value={f.max_similarity} threshold={plag?.threshold} color="var(--sim)" />}
-      {v && <Meter label="Security risk" value={v.risk_score / 100} text={`${v.risk_score}`} color="var(--sec)" />}
-
-      <div className="chips" style={{ margin: "12px 0" }}>
-        {[["ai", "AI blocks"], ["sim", "Similarity"], ["vuln", "Security"]].map(([k, l]) => (
-          <button key={k} className={`chip ${k}`} aria-pressed={layers[k]} title={LEGEND[k]} onClick={() => setLayers({ ...layers, [k]: !layers[k] })}>{l}</button>
-        ))}
-      </div>
-
-      {ai?.status === "ok" && (
-        <details open>
-          <summary>Why the AI score is what it is</summary>
-          <p className="muted">{Object.entries(ai.models).map(([m, x]) => `${m} ${pct(x.probability)}`).join(" · ")}. Bars to the right push toward “AI”, to the left toward “human”.</p>
-          {feat.length > 0 && (
-            <ResponsiveContainer width="100%" height={Math.max(120, feat.length * 26)}>
-              <BarChart data={feat} layout="vertical" margin={{ left: 10, right: 10 }}>
-                <XAxis type="number" hide /><YAxis type="category" dataKey="name" width={130} tick={{ fontSize: 12 }} />
-                <Tooltip formatter={(val, _n, p) => [`${val} (feature value ${p.payload.value})`, "contribution"]} />
-                <Bar dataKey="v">{feat.map((x, i) => <Cell key={i} fill={x.v > 0 ? "#6b46f0" : "#0e8a7b"} />)}</Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-          {ai.blocks.length > 0 && <>
-            <p className="muted">Blocks ranked by how much removing them changes the score:</p>
-            <ul className="list">{ai.blocks.map((b) => (
-              <li key={b.start}><button onClick={() => reveal(b.start)}>{b.name} (lines {b.start}–{b.end}) <b style={{ color: b.contribution > 0 ? "var(--ai)" : "var(--ok)" }}>{b.contribution > 0 ? "+" : ""}{b.contribution.toFixed(2)}</b></button></li>
-            ))}</ul>
-          </>}
-        </details>
-      )}
-
-      {plag && (
-        <details open={myPairs.length > 0}>
-          <summary>Similarity {myPairs.length ? `(${myPairs.length} comparison${myPairs.length > 1 ? "s" : ""})` : ""}</summary>
-          {names.length < 2 && !plag.corpus_matches?.length && <p className="muted">Add more files, or enable “Compare with saved corpus”, to check for copying.</p>}
-          {names.length > 1 && <Heatmap names={names} matrix={plag.matrix} selected={selPair} onSelect={(p) => setSelPair(selPair && selPair[0] === p[0] && selPair[1] === p[1] ? null : p)} />}
-          <ul className="list">{myPairs.map((p) => {
-            const other = p.a === f.name ? p.b : p.a;
-            const on = !!selPair && selPair[0] === p.a && selPair[1] === p.b;
-            return <li key={other}><button aria-pressed={on} onClick={() => { setSelPair(on ? null : [p.a, p.b]); const l = (p.a === f.name ? p.lines_a : p.lines_b)[0]; if (l) reveal(l[0]); }}>
-              {other}: <b>{pct(p.score)}</b> <span className="muted">(tokens {pct(p.token_similarity)}, structure {pct(p.ast_similarity)}){p.flagged ? " ⚑" : ""}</span></button></li>;
-          })}</ul>
-          {(plag.corpus_matches || []).filter((m) => m.a === f.name).map((m) => (
-            <p key={m.reference_id} className="muted">Saved corpus: {m.reference_name}, {pct(m.score)}</p>
-          ))}
-        </details>
-      )}
-
-      {v && (
-        <details open={v.findings.length > 0}>
-          <summary>Security findings ({v.findings.length})</summary>
-          {v.findings.length === 0 && <p className="muted">No rule matches. Static rules are not proof of safety.</p>}
-          <ul className="list">{v.findings.map((x, i) => (
-            <li key={i}><button onClick={() => reveal(x.line)}><span className={`sev ${x.severity}`}>{x.severity}</span>line {x.line} · {x.cwe}: {x.message}</button></li>
-          ))}</ul>
-          {v.ml.status === "ok"
-            ? <ul className="list">{v.functions.filter((x) => x.ml_flagged).map((x) => <li key={x.start}><button onClick={() => reveal(x.start)}>Model flags <b>{x.name}</b> ({pct(x.ml_probability)})</button></li>)}</ul>
-            : <p className="muted">Function-level model: {v.ml.message}</p>}
-        </details>
-      )}
-    </>
+    <Modal open onClose={onClose} title="Rename file"
+      footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" disabled={bad} onClick={() => onSave(state.i, v.trim())}>Rename</Button></>}>
+      <form onSubmit={(e) => { e.preventDefault(); if (!bad) onSave(state.i, v.trim()); }}>
+        <label className="field"><span>File name — the extension sets the language</span>
+          <input autoFocus value={v} onChange={(e) => setV(e.target.value)} className="input mono" /></label>
+        {clash && <p className="t-sec small">Another file already has this name.</p>}
+        {!clash && v && !isSupported(v) && <p className="muted small">Unknown extension: the server will auto-detect the language.</p>}
+      </form>
+    </Modal>
   );
 }
+

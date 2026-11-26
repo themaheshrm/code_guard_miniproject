@@ -11,6 +11,7 @@ def body(**opts):
 def test_health(client):
     j = client.get("/api/v1/health").json()
     assert j["status"] == "ok" and j["models"]["xgboost"]["available"] is False
+    assert j["models"]["heuristic"]["available"] is True and j["rules"] >= 40
 
 
 def test_sync_analysis_report_shape(client):
@@ -19,7 +20,10 @@ def test_sync_analysis_report_shape(client):
     res = r.json()["result"]
     assert res["plagiarism"]["pairs"][0]["score"] > 0.8 and res["plagiarism"]["clusters"] == [["a.py", "b.py"]]
     f = res["files"][0]
-    assert f["ai"]["status"] == "model_unavailable" and f["vulnerability"]["findings"] and f["verdict"]["disclaimer"]
+    # no trained model in the temp artefacts dir -> the always-available heuristic engine answers, and says so
+    assert f["ai"]["status"] == "ok" and f["ai"]["engine"] == "heuristic" and 0 <= f["ai"]["probability"] <= 1
+    assert f["vulnerability"]["findings"] and f["verdict"]["disclaimer"]
+    assert res["summary"]["n_files"] == 2 and res["summary"]["similar_pairs"] == 1
     assert f["warnings"]  # short snippet warning
 
 
@@ -136,3 +140,112 @@ def test_orphaned_jobs_recovered_on_startup(tmp_path):
         assert r_fail["status"] == "failed"
         assert r_fail["error"] == "Prior failure"
 
+
+
+def _wait(client, url, key="status"):
+    for _ in range(200):
+        j = client.get(url).json()
+        if j[key] not in ("queued", "running"):
+            return j
+        time.sleep(0.05)
+    return j
+
+
+def test_timestamps_are_utc_and_titles_default(client):
+    j = client.post("/api/v1/analyze", json={**body(), "title": "  Lab 3  "}).json()
+    assert j["created_at"].endswith("+00:00") and j["finished_at"] and j["title"] == "Lab 3"
+    single = client.post("/api/v1/analyze", json={"files": [{"name": "x.py", "code": CODE_A}]}).json()
+    assert single["title"] == "x.py" and single["summary"]["n_files"] == 1
+
+
+def test_stats_rules_export_and_clear_history(client):
+    client.post("/api/v1/analyze", json=body())
+    st = client.get("/api/v1/stats").json()
+    assert st["totals"]["analyses"] == 1 and st["totals"]["files"] == 2 and st["severity"]["high"] >= 2
+    assert st["top_cwes"][0]["cwe"] == "CWE-78" and len(st["timeline"]) == 14 and st["timeline"][-1]["analyses"] == 1
+    rules = client.get("/api/v1/rules?language=java").json()
+    assert rules["count"] > 5 and all("java" in r["languages"] for r in rules["rules"])
+    aid = st["recent"][0]["id"]
+    ex = client.get(f"/api/v1/analyses/{aid}/export")
+    assert ex.status_code == 200 and "attachment" in ex.headers["content-disposition"] and ex.json()["id"] == aid
+    assert [a["id"] for a in client.get("/api/v1/analyses?q=Batch").json()] == [aid]
+    assert client.delete("/api/v1/analyses").status_code == 204 and client.get("/api/v1/analyses").json() == []
+
+
+def test_corpus_item_and_clear_keeps_corpus(client):
+    client.post("/api/v1/analyze", json=body(persist=True))
+    items = client.get("/api/v1/corpus").json()
+    one = client.get(f"/api/v1/corpus/{items[0]['id']}").json()
+    assert one["code"] in (CODE_A, CODE_B) and items[0]["lines"] >= 4
+    client.delete("/api/v1/analyses")  # corpus-backed analyses survive unless include_corpus=true
+    assert len(client.get("/api/v1/corpus").json()) == 2
+    client.delete("/api/v1/analyses?include_corpus=true")
+    assert client.get("/api/v1/corpus").json() == []
+
+
+def test_cross_language_files_are_not_compared_and_crlf_normalised(client):
+    files = [{"name": "a.py", "code": CODE_A.replace("\n", "\r\n")}, {"name": "a.js", "code": "function f(u){ return u.length }\n"}]
+    res = client.post("/api/v1/analyze", json={"files": files}).json()["result"]
+    assert res["plagiarism"]["pairs"] == [] and res["files"][0]["vulnerability"]["findings"][0]["line"] == 3
+    assert client.post("/api/v1/analyze", json={"files": [{"name": "a.py", "code": "x=1", "language": "cobol"}]}).status_code == 422
+
+
+def test_security_headers_and_upload_limits(client):
+    r = client.get("/api/v1/health")
+    assert r.headers["x-content-type-options"] == "nosniff" and r.headers["x-frame-options"] == "DENY"
+    big = "x = 1\n" * 100_000
+    r = client.post("/api/v1/jobs/upload", files=[("files", ("big.py", big))])
+    assert r.status_code == 413
+    r = client.post("/api/v1/jobs/upload", files=[("files", ("bin.py", b"\x00\x01\x02abc"))])
+    assert r.status_code == 422
+
+
+def test_rate_limit(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.config import get_settings
+    from app.main import create_app
+
+    monkeypatch.setenv("CODEGUARD_RATE_LIMIT_PER_MINUTE", "2")
+    monkeypatch.setenv("CODEGUARD_ARTIFACTS_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    with TestClient(create_app("sqlite:///:memory:")) as c:
+        codes = [c.post("/api/v1/analyze", json={"files": [{"name": "a.py", "code": "x = 1"}]}).status_code for _ in range(3)]
+    get_settings.cache_clear()
+    assert codes == [200, 200, 429]
+
+
+def test_train_xgboost_from_ui_and_hot_reload(client, pair_rows):
+    import json as _json
+
+    data = "\n".join(_json.dumps(r) for r in pair_rows)
+    assert client.post("/api/v1/train/xgboost", files={"dataset": ("d.jsonl", "not json")}).status_code == 422
+    t = client.post("/api/v1/train/xgboost", files={"dataset": ("d.jsonl", data)}).json()
+    t = _wait(client, f"/api/v1/tasks/{t['id']}")
+    assert t["status"] == "done", t
+    assert client.get("/api/v1/health").json()["models"]["xgboost"]["available"] is True
+    assert client.get("/api/v1/metrics").json()["xgboost"]["test"]
+    f = client.post("/api/v1/analyze", json=body()).json()["result"]["files"][0]
+    assert f["ai"]["engine"] == "ensemble" and set(f["ai"]["models"]) == {"xgboost", "heuristic"}
+
+
+def test_plagiarism_benchmark_task(client):
+    t = client.post("/api/v1/benchmark/plagiarism?n=20").json()
+    t = _wait(client, f"/api/v1/tasks/{t['id']}")
+    assert t["status"] == "done" and t["result"]["n_programs"] >= 10
+    assert client.get("/api/v1/metrics").json()["plagiarism"]["sweep"]
+
+
+def test_old_database_is_migrated(tmp_path):
+    import sqlite3
+
+    from app.db import init_db
+
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE analyses (id VARCHAR(32) PRIMARY KEY, created_at DATETIME, mode VARCHAR(16), status VARCHAR(16), "
+                "n_files INTEGER, persist BOOLEAN, result JSON, error TEXT)")
+    con.commit(); con.close()
+    init_db(f"sqlite:///{db}")
+    cols = {r[1] for r in sqlite3.connect(db).execute("PRAGMA table_info(analyses)")}
+    assert {"title", "summary", "finished_at"} <= cols
